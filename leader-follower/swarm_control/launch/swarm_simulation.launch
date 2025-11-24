@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Запуск симуляции с тремя квадрокоптерами -->
+    <include file="$(find px4)/launch/multi_uav_mavros_sitl.launch">
+        <arg name="vehicle" value="iris"/>
+    </include>
+
+    <!-- Запуск контроллера роя -->
+    <node name="swarm_controller" pkg="swarm_control" type="swarm_controller.py" output="screen" respawn="true"/>
+</launch>

@@ -1,0 +1,60 @@
+<launch>
+    <!-- Fixed two drones launch file -->
+    <arg name="vehicle" default="iris"/>
+    
+    <!-- Gazebo sim -->
+    <include file="$(find gazebo_ros)/launch/empty_world.launch">
+        <arg name="world_name" value="$(find mavlink_sitl_gazebo)/worlds/empty.world"/>
+        <arg name="gui" value="true"/>
+        <arg name="verbose" value="false"/>
+    </include>
+
+    <!-- UAV0 -->
+    <group ns="uav0">
+        <arg name="ID" value="0"/>
+        <arg name="fcu_url" default="udp://:14540@localhost:14580"/>
+        
+        <!-- PX4 SITL with explicit work directory -->
+        <node name="sitl_$(arg ID)" pkg="px4" type="px4" output="screen"
+              args="$(find px4)/build/px4_sitl_default/etc -s etc/init.d-posix/rcS -i $(arg ID) -w $(find px4)/build/px4_sitl_default/rootfs/uav0 $(find px4)/build/px4_sitl_default">
+            <env name="PX4_SIM_MODEL" value="$(arg vehicle)" />
+        </node>
+        
+        <!-- Spawn vehicle -->
+        <node name="$(anon vehicle_spawn)" pkg="gazebo_ros" type="spawn_model" output="screen" 
+              args="-sdf -file $(find mavlink_sitl_gazebo)/models/$(arg vehicle)/$(arg vehicle).sdf -model uav0 -x 0 -y 0 -z 0 -R 0 -P 0 -Y 0"/>
+        
+        <!-- MAVROS -->
+        <include file="$(find mavros)/launch/px4.launch">
+            <arg name="fcu_url" value="$(arg fcu_url)"/>
+            <arg name="tgt_system" value="$(eval 1 + arg('ID'))"/>
+            <arg name="namespace" value="uav0"/>
+        </include>
+    </group>
+
+    <!-- UAV1 with delay -->
+    <group ns="uav1">
+        <arg name="ID" value="1"/>
+        <arg name="fcu_url" default="udp://:14541@localhost:14581"/>
+        
+        <!-- Delay for UAV1 startup -->
+        <arg name="node_start_delay" value="10.0" />
+        
+        <!-- PX4 SITL with explicit work directory and delay -->
+        <node name="sitl_$(arg ID)" pkg="px4" type="px4" output="screen" launch-prefix="bash -c 'sleep $(arg node_start_delay); $0 $@' "
+              args="$(find px4)/build/px4_sitl_default/etc -s etc/init.d-posix/rcS -i $(arg ID) -w $(find px4)/build/px4_sitl_default/rootfs/uav1 $(find px4)/build/px4_sitl_default">
+            <env name="PX4_SIM_MODEL" value="$(arg vehicle)" />
+        </node>
+        
+        <!-- Spawn vehicle with delay -->
+        <node name="$(anon vehicle_spawn)" pkg="gazebo_ros" type="spawn_model" output="screen" launch-prefix="bash -c 'sleep $(arg node_start_delay); $0 $@' "
+              args="-sdf -file $(find mavlink_sitl_gazebo)/models/$(arg vehicle)/$(arg vehicle).sdf -model uav1 -x 2 -y 0 -z 0 -R 0 -P 0 -Y 0"/>
+        
+        <!-- MAVROS with delay -->
+        <include file="$(find mavros)/launch/px4.launch" launch-prefix="bash -c 'sleep $(arg node_start_delay); $0 $@' ">
+            <arg name="fcu_url" value="$(arg fcu_url)"/>
+            <arg name="tgt_system" value="$(eval 1 + arg('ID'))"/>
+            <arg name="namespace" value="uav1"/>
+        </include>
+    </group>
+</launch>
