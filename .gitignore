@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# снимки и результаты прогонов
+raw_images/
+mosaic*.jpg
