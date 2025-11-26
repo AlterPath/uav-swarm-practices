@@ -1,0 +1,35 @@
+// ROS Swarm Control System
+digraph {
+	rankdir=LR
+	splines=ortho
+	nodesep=0.6
+	ranksep=1.0
+	node [fillcolor=white fontname=Arial fontsize=12 shape=rect style="rounded,filled"]
+	edge [fontname=Arial fontsize=10]
+	subgraph cluster_controller {
+		color=grey label="Control Logic" style=dashed
+		Controller [label="Swarm Controller Node
+(swarm_controller.py)" fillcolor=lightblue shape=component style=filled]
+	}
+	mavros_uav0 -> Controller [label=<uav0/mavros/state<br/>uav0/mavros/local_position/pose> color=blue]
+	Controller -> mavros_uav0 [label=<uav0/mavros/setpoint_position/local<br/><i>Services: Arming, SetMode</i>> color=red style=dashed]
+	subgraph cluster_uav0 {
+		color=black label="Namespace: /uav0" style=solid
+		mavros_uav0 [label="MAVROS Node
+(uav0)" fillcolor=lightgrey]
+	}
+	mavros_uav1 -> Controller [label=<uav1/mavros/state<br/>uav1/mavros/local_position/pose> color=blue]
+	Controller -> mavros_uav1 [label=<uav1/mavros/setpoint_position/local<br/><i>Services: Arming, SetMode</i>> color=red style=dashed]
+	subgraph cluster_uav1 {
+		color=black label="Namespace: /uav1" style=solid
+		mavros_uav1 [label="MAVROS Node
+(uav1)" fillcolor=lightgrey]
+	}
+	mavros_uav2 -> Controller [label=<uav2/mavros/state<br/>uav2/mavros/local_position/pose> color=blue]
+	Controller -> mavros_uav2 [label=<uav2/mavros/setpoint_position/local<br/><i>Services: Arming, SetMode</i>> color=red style=dashed]
+	subgraph cluster_uav2 {
+		color=black label="Namespace: /uav2" style=solid
+		mavros_uav2 [label="MAVROS Node
+(uav2)" fillcolor=lightgrey]
+	}
+}
