@@ -1,35 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-build_map_simple.py — простая склейка ортофотоплана по координатам.
-
-Сценарий: без потери дрона, без препятствий (или с препятствиями —
-они просто рисуются поверх как круги).
-
-Идея максимально простая:
-  1. Для каждого снимка известны (pos_x, pos_y) центра и высота agl_m.
-  2. Размер следа на земле считаем из FOV: foot = 2*h*tan(FOV/2).
-  3. Снимок масштабируется до этого размера в пикселях холста и
-     кладётся на холст с центром в (pos_x, pos_y).
-  4. Никакой гомографии — только перенос и масштаб.
-     Yaw, если нужен, учитывается простым cv2.warpAffine
-     (плоский поворот вокруг центра).
-
-Запуск:
-    python3 build_map_simple.py \
-        --photos photos_apf_lanes_uav0.csv \
-                 photos_apf_lanes_uav1.csv \
-                 photos_apf_lanes_uav2.csv \
-        --imgdir raw_images \
-        --out    mosaic.jpg \
-        --obstacles obstacles.txt   # необязательно
-
-    # Тестовый режим без реальных снимков:
-    python3 build_map_simple.py --demo --out mosaic_demo.jpg
-
-Требования:
-    pip install opencv-python numpy pandas
-"""
 
 import argparse
 import math
@@ -41,88 +11,50 @@ import numpy as np
 import pandas as pd
 
 
-# =============================================================================
-# ПАРАМЕТРЫ — менять при необходимости
-# =============================================================================
+CAM_HFOV_DEG    = 114.0
+CAM_ROTATE_CW90 = True
 
-# Параметры камеры Gazebo (down_camera_link)
-CAM_HFOV_DEG    = 114.0   # горизонтальный FOV, ° (как в исходном скрипте)
-CAM_ROTATE_CW90 = True    # снимок сохраняется повёрнутым на 90° по часовой?
+CANVAS_RES_M_PX = 0.05
+CANVAS_MARGIN_M = 3.0
+BG_COLOR        = (50, 50, 50)
 
-# Параметры выходной карты
-CANVAS_RES_M_PX = 0.05    # метров на пиксель
-CANVAS_MARGIN_M = 3.0     # отступ вокруг крайних снимков, м
-BG_COLOR        = (50, 50, 50)   # фон холста (BGR)
-
-# Учитывать ли yaw при наложении (для прямых траекторий обычно не нужно).
 USE_YAW = False
 
-# Степень cos-окна при мягком смешивании (soft blend).
-# = 2  → стандартное окно Хэнна, плавные переходы.
-# = 6  → более резкие границы, меньше размытия на стыках.
-# = 12 → почти как hard blend, но без резких ступенек.
 BLEND_POWER = 6
 
-# Минимальная допустимая высота — снимок ниже считаем мусором.
 MIN_AGL_M = 0.3
 
-# Захардкоженные мировые Y-координаты СТАРТА каждого дрона (м).
-# Дроны пишут pos_y относительно своей стартовой точки, поэтому каждый снимок
-# смещается так, чтобы первый pos_y дрона совпал с этим значением.
-# Ключ — подстрока имени CSV-файла (обычно содержит "uav0/1/2").
 UAV_LANE_Y = {
-    'uav0': 1.6,   # нижняя полоса
-    'uav1': 4.9,   # средняя полоса
-    'uav2': 8.6,   # верхняя полоса
+    'uav0': 1.6,
+    'uav1': 4.9,
+    'uav2': 8.6,
 }
 
-# Принудительная высота для всех снимков (м). None — брать из CSV.
-# Меняй здесь, если нужно сменить высоту склейки глобально.
 DEFAULT_FORCE_AGL_M = 4.0
 
-# =============================================================================
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Утилиты
-# ─────────────────────────────────────────────────────────────────────────────
 
 def effective_fovs(hfov_deg: float, img_w: int, img_h: int,
                    rotate_cw90: bool) -> tuple:
-    """
-    Возвращает (fov_along_img_width_deg, fov_along_img_height_deg)
-    для итогового (возможно повёрнутого) снимка.
-
-    Логика: исходный кадр img_w × img_h имеет HFOV вдоль ширины.
-    VFOV считается из соотношения сторон при fx=fy:
-        tan(VFOV/2) = tan(HFOV/2) * H / W
-    После поворота на 90° горизонталь и вертикаль меняются местами.
-    """
     hfov = math.radians(hfov_deg)
     vfov = 2.0 * math.atan(math.tan(hfov / 2.0) * img_h / img_w)
 
     if rotate_cw90:
-        # После поворота ширина рот.снимка = исходная высота,
-        # значит вдоль новой ширины действует исходный VFOV.
         return (math.degrees(vfov), math.degrees(hfov))
     else:
         return (math.degrees(hfov), math.degrees(vfov))
 
 
 def footprint_meters(fov_w_deg: float, fov_h_deg: float, agl: float) -> tuple:
-    """Размер следа снимка на земле в метрах: (по ширине, по высоте)."""
     fw = 2.0 * agl * math.tan(math.radians(fov_w_deg) / 2.0)
     fh = 2.0 * agl * math.tan(math.radians(fov_h_deg) / 2.0)
     return fw, fh
 
 
 def load_photos(paths: list) -> pd.DataFrame:
-    """Объединяет несколько photos_*.csv в один DataFrame с ok==1."""
     frames = []
     for p in paths:
         df = pd.read_csv(p)
         df.columns = [c.strip().lower() for c in df.columns]
-        # Уникальный идентификатор источника (для отладки)
         df['_src'] = os.path.basename(p)
         frames.append(df)
     data = pd.concat(frames, ignore_index=True)
@@ -136,23 +68,12 @@ def load_photos(paths: list) -> pd.DataFrame:
 
 def apply_hardcoded_lane_offsets(photos: pd.DataFrame,
                                  lane_y: dict = None) -> pd.DataFrame:
-    """
-    Применяет ЗАХАРДКОЖЕННЫЕ смещения по Y из UAV_LANE_Y.
-
-    Для каждого CSV-источника (uav0/uav1/uav2) находим первый pos_y дрона
-    и сдвигаем ВСЕ его снимки так, чтобы стартовая Y стала равна
-    target_y из словаря. По X дрон уже стартует в ~0, так что не трогаем.
-
-    Эта функция вызывается АВТОМАТИЧЕСКИ при загрузке (без CLI-флагов).
-    Чтобы изменить полосы — правь UAV_LANE_Y в начале файла.
-    """
     photos = photos.copy()
     lane_y = lane_y or UAV_LANE_Y
     srcs = photos['_src'].unique()
 
     print(f'[offset/hardcoded] Применяю смещения из UAV_LANE_Y: {lane_y}')
     for src in srcs:
-        # Ищем подходящий ключ (uav0/uav1/uav2) в имени файла
         matched_key = None
         for key in lane_y:
             if key in src.lower():
@@ -180,19 +101,6 @@ def apply_lane_offsets(photos: pd.DataFrame,
                        cam_fov_deg: float = None,
                        overlap: float = None,
                        manual_offsets: dict = None) -> pd.DataFrame:
-    """
-    Корректирует pos_x / pos_y каждого дрона, добавляя его lane offset.
-
-    Дроны пишут координаты относительно своей стартовой точки (физической).
-    Чтобы правильно склеить карту, нужно привести всех к единой мировой СК.
-
-    mode='auto'   — вычисляет центры полос по тем же формулам, что
-                    apf_with_lanes_drones.py (stripe × (rank + 0.5)).
-                    Требует field_wid, cam_fov_deg, overlap.
-                    Offset = lane_center - first_pos_y дрона.
-
-    mode='manual' — берёт смещения из словаря {src_basename: (dx, dy)}.
-    """
     photos = photos.copy()
     srcs = photos['_src'].unique()
 
@@ -200,7 +108,6 @@ def apply_lane_offsets(photos: pd.DataFrame,
         if field_wid is None or cam_fov_deg is None or overlap is None:
             raise ValueError('auto-режим требует field_wid, cam_fov_deg, overlap')
 
-        # Средняя высота по всем снимкам (для расчёта stripe)
         mean_agl = photos['agl_m'].abs().mean()
         fov_rad  = math.radians(cam_fov_deg)
         stripe   = 2.0 * mean_agl * math.tan(fov_rad / 2.0) * (1.0 - overlap)
@@ -215,7 +122,6 @@ def apply_lane_offsets(photos: pd.DataFrame,
             first_y     = photos.loc[mask, 'pos_y'].iloc[0]
             first_x     = photos.loc[mask, 'pos_x'].iloc[0]
             dy = lane_center - first_y
-            # По X все дроны стартуют в x≈0, оставляем как есть
             dx = -first_x if abs(first_x) > 0.5 else 0.0
             photos.loc[mask, 'pos_y'] += dy
             photos.loc[mask, 'pos_x'] += dx
@@ -241,7 +147,6 @@ def apply_lane_offsets(photos: pd.DataFrame,
 
 
 def load_obstacles(path: str) -> list:
-    """obstacles.txt → [(x, y, r), ...]. Возвращает пустой список, если файла нет."""
     obs = []
     if not path or not os.path.exists(path):
         return obs
@@ -258,13 +163,11 @@ def load_obstacles(path: str) -> list:
 
 
 def find_image(filename: str, imgdir: str) -> str:
-    """Ищет файл снимка в imgdir и подпапках (raw_images/uav0/...)."""
     basename = os.path.basename(filename)
     for c in (filename, os.path.join(imgdir, filename),
               os.path.join(imgdir, basename)):
         if os.path.isfile(c):
             return c
-    # Перебор подпапок первого уровня
     try:
         for e in os.scandir(imgdir):
             if e.is_dir():
@@ -273,30 +176,13 @@ def find_image(filename: str, imgdir: str) -> str:
                     return p
     except OSError:
         pass
-    # Полный walk на случай вложенности
     for root, _, files in os.walk(imgdir):
         if basename in files:
             return os.path.join(root, basename)
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Основной алгоритм склейки
-# ─────────────────────────────────────────────────────────────────────────────
-
 def center_weight_map(h_px: int, w_px: int, soft: bool = True) -> np.ndarray:
-    """
-    Вес пикселя как функция от его положения внутри кадра.
-    Soft режим: w = cos(π/2 · d)²  (плавный спад от 1 в центре до 0 в углу,
-                                    нулевые производные на обоих концах).
-    Hard режим: вернёт «расстояние до центра» (для совместимости с прежней
-                логикой winner-takes-all — в этом файле уже не используется).
-
-    Гладкий вес нужен для того, чтобы около границ между соседними снимками
-    оба кадра вкладывались примерно одинаково, и мелкие рассогласования
-    (вибрация дрона, шум положения) растворялись в плавном переходе,
-    а не превращались в «шевроны» на резкой границе Вороного.
-    """
     yy, xx = np.meshgrid(np.arange(h_px, dtype=np.float32),
                          np.arange(w_px, dtype=np.float32),
                          indexing='ij')
@@ -307,9 +193,6 @@ def center_weight_map(h_px: int, w_px: int, soft: bool = True) -> np.ndarray:
     dist = np.sqrt(dx * dx + dy * dy)
     if not soft:
         return dist
-    # Cos^BLEND_POWER-окно, обрезанное по dist=1.
-    # BLEND_POWER > 2 → более резкие границы (центр снимка доминирует сильнее).
-    # BLEND_POWER = 2 → исходное мягкое окно Хэнна.
     clipped = np.minimum(dist, 1.0)
     return np.cos(np.pi / 2.0 * clipped) ** BLEND_POWER
 
@@ -320,24 +203,8 @@ def build_map(photos: pd.DataFrame, imgdir: str,
               margin: float = CANVAS_MARGIN_M,
               use_yaw: bool = USE_YAW,
               hard_blend: bool = False) -> tuple:
-    """
-    Возвращает (mosaic, origin_x, origin_y) — готовая карта и мировой
-    левый-нижний угол холста.
-
-    Режим склейки (по умолчанию — мягкое смешивание):
-      • Накапливаем взвешенную сумму цветов: canvas_acc += patch · weight.
-      • Накапливаем сумму весов:              weight_acc += weight.
-      • Итог: canvas = canvas_acc / weight_acc.
-      Вес = cos²(π/2 · d), где d — нормированное расстояние от центра кадра.
-      В центре снимка вес = 1, на углах = 0. Около границ между соседними
-      снимками веса сравнимы → плавный переход вместо «шевронов».
-
-    Если hard_blend=True — старая логика «победил кадр с минимальным
-    расстоянием до своего центра». Резче, но с возможными ступеньками.
-    """
     obstacles = obstacles or []
 
-    # ── шаг 1: определить границы холста ──────────────────────────────────────
     max_agl = float(photos['agl_m'].abs().max())
     fov_w, fov_h = effective_fovs(CAM_HFOV_DEG, 640, 480, CAM_ROTATE_CW90)
     max_fw, max_fh = footprint_meters(fov_w, fov_h, max_agl)
@@ -356,7 +223,6 @@ def build_map(photos: pd.DataFrame, imgdir: str,
         best_dist = np.full((canvas_h, canvas_w), 999.0, dtype=np.float32)
         canvas_acc = weight_acc = None
     else:
-        # Аккумуляторы для взвешенного среднего
         canvas_acc = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
         weight_acc = np.zeros((canvas_h, canvas_w),    dtype=np.float32)
         canvas = best_dist = None
@@ -368,7 +234,6 @@ def build_map(photos: pd.DataFrame, imgdir: str,
           f'res={resolution} м/пкс, режим=' +
           ('hard' if hard_blend else 'soft'))
 
-    # ── шаг 2: каждый снимок → масштаб, перенос, смешивание ──────────────────
     placed   = 0
     skipped  = 0
 
@@ -383,8 +248,6 @@ def build_map(photos: pd.DataFrame, imgdir: str,
             skipped += 1
             continue
 
-        # FIX 1: запоминаем оригинальные размеры ДО поворота,
-        # чтобы effective_fovs не учитывал поворот дважды.
         orig_h, orig_w = img.shape[:2]
 
         if CAM_ROTATE_CW90:
@@ -395,21 +258,17 @@ def build_map(photos: pd.DataFrame, imgdir: str,
             skipped += 1
             continue
 
-        # Размер следа на земле — используем оригинальные размеры кадра.
-        # effective_fovs сам учтёт поворот через флаг CAM_ROTATE_CW90.
         fov_w_i, fov_h_i = effective_fovs(CAM_HFOV_DEG, orig_w, orig_h, CAM_ROTATE_CW90)
         fw_m, fh_m = footprint_meters(fov_w_i, fov_h_i, agl)
         fw_px = max(1, int(round(fw_m / resolution)))
         fh_px = max(1, int(round(fh_m / resolution)))
 
-        # Масштабируем снимок и карту весов до размера следа
         patch = cv2.resize(img, (fw_px, fh_px), interpolation=cv2.INTER_AREA)
         if hard_blend:
-            wmap = center_weight_map(fh_px, fw_px, soft=False)   # = расстояние
+            wmap = center_weight_map(fh_px, fw_px, soft=False)
         else:
-            wmap = center_weight_map(fh_px, fw_px, soft=True)    # = вес
+            wmap = center_weight_map(fh_px, fw_px, soft=True)
 
-        # Yaw — плоский поворот вокруг центра
         if use_yaw and 'yaw_rad' in row and not pd.isna(row['yaw_rad']):
             yaw_deg = math.degrees(float(row['yaw_rad']))
             M = cv2.getRotationMatrix2D((fw_px / 2.0, fh_px / 2.0),
@@ -418,15 +277,12 @@ def build_map(photos: pd.DataFrame, imgdir: str,
                                    flags=cv2.INTER_LINEAR,
                                    borderMode=cv2.BORDER_CONSTANT,
                                    borderValue=BG_COLOR)
-            # За пределами повёрнутого кадра: в hard — «бесконечное расстояние»,
-            #                                  в soft — нулевой вес.
             bv = 999.0 if hard_blend else 0.0
             wmap = cv2.warpAffine(wmap, M, (fw_px, fh_px),
                                   flags=cv2.INTER_LINEAR,
                                   borderMode=cv2.BORDER_CONSTANT,
                                   borderValue=bv)
 
-        # Координаты центра на холсте (Y инвертирован: ENU → OpenCV)
         cx = (float(row['pos_x']) - x_min) / resolution
         cy = canvas_h - 1 - (float(row['pos_y']) - y_min) / resolution
         x0 = int(round(cx - fw_px / 2.0))
@@ -443,9 +299,6 @@ def build_map(photos: pd.DataFrame, imgdir: str,
         if dx1 > dx0 and dy1 > dy0 and sx1 > sx0 and sy1 > sy0:
             sub_bgr = patch[sy0:sy1, sx0:sx1]
             sub_w   = wmap [sy0:sy1, sx0:sx1]
-            # FIX 2: маска валидности по карте весов, а не по цвету.
-            # Старый вариант (sum > 0) ошибочно отбрасывал законно чёрные
-            # пиксели (тени, тёмный асфальт и т.п.).
             valid = sub_w > (0.01 if hard_blend else 1e-4)
 
             if hard_blend:
@@ -455,8 +308,6 @@ def build_map(photos: pd.DataFrame, imgdir: str,
                 cv_bgr [improve] = sub_bgr [improve]
                 cv_dist[improve] = sub_w   [improve]
             else:
-                # Soft: накапливаем взвешенное среднее.
-                # Невалидные пиксели (после поворота) идут с нулевым весом.
                 w = sub_w * valid.astype(np.float32)
                 canvas_acc[dy0:dy1, dx0:dx1] += sub_bgr.astype(np.float32) \
                                                 * w[:, :, None]
@@ -466,14 +317,12 @@ def build_map(photos: pd.DataFrame, imgdir: str,
         if (placed + skipped) % 20 == 0:
             print(f'  обработано: {placed + skipped}/{len(photos)}', end='\r')
 
-    # Финализация
     if hard_blend:
         covered = int((best_dist < 999.0).sum())
     else:
         covered = int((weight_acc > 1e-6).sum())
         canvas = np.full((canvas_h, canvas_w, 3), BG_COLOR, dtype=np.uint8)
         valid = weight_acc > 1e-6
-        # Нормализуем: cv_acc / w_acc, BG там, где не было ни одного кадра
         wsafe = np.where(valid, weight_acc, 1.0)[:, :, None]
         avg   = (canvas_acc / wsafe).clip(0, 255).astype(np.uint8)
         canvas[valid] = avg[valid]
@@ -482,13 +331,11 @@ def build_map(photos: pd.DataFrame, imgdir: str,
     print(f'\n[stitch] Положено: {placed}, пропущено: {skipped}, '
           f'покрытие холста: {pct:.1f}%')
 
-    # ── шаг 3: препятствия поверх ────────────────────────────────────────────
     if obstacles:
         for ox, oy, orad in obstacles:
             cx_o = int(round((ox - x_min) / resolution))
             cy_o = int(round(canvas_h - 1 - (oy - y_min) / resolution))
             r    = max(1, int(round(orad / resolution)))
-            # Полупрозрачная заливка
             overlay = canvas.copy()
             cv2.circle(overlay, (cx_o, cy_o), r, (0, 0, 220), -1)
             cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0, canvas)
@@ -500,7 +347,6 @@ def build_map(photos: pd.DataFrame, imgdir: str,
 
 def draw_grid(mosaic: np.ndarray, origin_x: float, origin_y: float,
               resolution: float, step_m: float = 10.0) -> np.ndarray:
-    """Простая координатная сетка с подписями осей."""
     out = mosaic.copy()
     h, w = out.shape[:2]
     color_grid, color_label = (180, 180, 180), (240, 240, 240)
@@ -525,22 +371,12 @@ def draw_grid(mosaic: np.ndarray, origin_x: float, origin_y: float,
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Демо-режим: генерируем синтетическое поле и «летаем» по нему змейкой
-# ─────────────────────────────────────────────────────────────────────────────
-
 def generate_demo(out_dir: str = '/tmp/demo_simple',
                   field_len: float = 60.0,
                   field_wid: float = 30.0,
                   altitude: float = 2.5,
                   n_drones: int = 3,
                   overlap: float = 0.75) -> tuple:
-    """
-    Создаёт текстуру поля + photos.csv + папку с псевдоснимками.
-    overlap — доля перекрытия соседних снимков (0.0..1.0).
-      0.75 → шаг = 25% footprint (исходное значение).
-      0.90 → шаг = 10% footprint, снимки почти вплотную.
-    """
     imgdir = os.path.join(out_dir, 'raw_images')
     os.makedirs(imgdir, exist_ok=True)
     res = CANVAS_RES_M_PX
@@ -548,52 +384,42 @@ def generate_demo(out_dir: str = '/tmp/demo_simple',
     fw_px = int(field_len / res)
     fh_px = int(field_wid / res)
 
-    # Текстура: зелёная трава + диагональная коричневая дорожка
     field = np.full((fh_px, fw_px, 3), (35, 75, 50), dtype=np.uint8)
     np.random.seed(0)
     noise = np.random.randint(-12, 12, field.shape, dtype=np.int16)
     field = np.clip(field.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
-    # Диагональная дорожка из угла в угол
     pts = np.array([
         [int(0.55 * fw_px), int(0.20 * fh_px)],
         [int(0.95 * fw_px), int(0.85 * fh_px)],
     ], np.int32)
     cv2.line(field, tuple(pts[0]), tuple(pts[1]), (50, 110, 150), 18)
 
-    # Несколько ярких маркеров для проверки выравнивания
     for lx, ly in [(10, 5), (30, 15), (50, 25), (15, 20), (45, 10)]:
         cv2.circle(field, (int(lx / res), int(ly / res)), 6, (0, 200, 0), -1)
 
-    # Размеры следа при заданной высоте
     fov_w, fov_h = effective_fovs(CAM_HFOV_DEG, 640, 480, CAM_ROTATE_CW90)
     foot_w, foot_h = footprint_meters(fov_w, fov_h, altitude)
-    overlap = max(0.01, min(0.99, overlap))   # защита от деления на 0
+    overlap = max(0.01, min(0.99, overlap))
     step_x = foot_w * (1.0 - overlap)
     print(f'[demo] overlap={overlap:.0%}, шаг={step_x:.2f} м (footprint={foot_w:.2f}×{foot_h:.2f} м)')
     rows, pid = [], 0
 
-    # Каждый дрон летит по своей одной полосе — это и есть сценарий apf_lanes.
     for drone_id in range(n_drones):
         lane_y = field_wid * (drone_id + 0.5) / n_drones
-        # Один проход по X слева направо
         x = 0.0
         while x <= field_len + 1e-3:
-            # Вырезаем footprint из текстуры поля
             fx0_px = max(0, int((x - foot_w / 2) / res))
             fy0_px = max(0, int((lane_y - foot_h / 2) / res))
             fx1_px = min(fw_px, int((x + foot_w / 2) / res))
             fy1_px = min(fh_px, int((lane_y + foot_h / 2) / res))
 
             if fx1_px > fx0_px and fy1_px > fy0_px:
-                # ВАЖНО: y_world растёт «вверх», в текстуре y_pixel растёт «вниз» —
-                # переворачиваем по вертикали при выборке.
                 patch = field[fh_px - fy1_px:fh_px - fy0_px,
                               fx0_px:fx1_px]
                 patch = cv2.resize(patch, (480, 640) if CAM_ROTATE_CW90
                                           else (640, 480))
                 if CAM_ROTATE_CW90:
-                    # Имитируем, что в файле снимок «как с камеры» (CCW90 от земного).
                     patch = cv2.rotate(patch, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
                 fname = f'uav{drone_id}_photo_{pid:05d}.jpg'
@@ -616,76 +442,35 @@ def generate_demo(out_dir: str = '/tmp/demo_simple',
     return [csv_path], imgdir
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main():
-    p = argparse.ArgumentParser(
-        description='Простая склейка ортофотоплана по координатам.')
-    p.add_argument('--photos', nargs='+', default=None,
-                   help='Список photos_*.csv')
-    p.add_argument('--imgdir', default='.', help='Папка со снимками')
-    p.add_argument('--out',    default='mosaic.jpg',
-                   help='Путь к выходному файлу')
-    p.add_argument('--obstacles', default=None,
-                   help='obstacles.txt (необязательно)')
-    p.add_argument('--resolution', type=float, default=CANVAS_RES_M_PX,
-                   help=f'м/пиксель (default {CANVAS_RES_M_PX})')
-    p.add_argument('--yaw', action='store_true',
-                   help='Учитывать yaw при наложении')
-    p.add_argument('--grid', action='store_true',
-                   help='Нанести координатную сетку')
-    p.add_argument('--demo', action='store_true',
-                   help='Сгенерировать тестовые снимки и собрать карту')
-    p.add_argument('--overlap', type=float, default=0.75,
-                   help='Перекрытие между снимками в демо-режиме: 0.0..1.0 '
-                        '(default 0.75 = 75%%). Чем больше, тем чаще снимки.')
-    p.add_argument('--force-agl', type=float, default=None,
-                   metavar='METERS',
-                   help='Принудительно задать высоту (agl_m) для всех снимков, '
-                        'игнорируя значение из CSV. Меньше → патч меньше (меньше overlap). '
-                        'Больше → патч больше (больше overlap). Пример: --force-agl 3.5')
-    # ── Коррекция смещений дронов ─────────────────────────────────────────────
-    p.add_argument('--offset-mode', choices=['none', 'auto', 'manual'],
-                   default='none',
-                   help='Коррекция смещений дронов. '
-                        'none — не трогать (по умолчанию). '
-                        'auto — вычислить по формуле stripe*(rank+0.5), '
-                        'нужны --field-wid, --cam-fov, --drone-overlap. '
-                        'manual — задать вручную через --uav-offset.')
-    p.add_argument('--field-wid', type=float, default=30.0,
-                   help='Ширина поля в метрах (для --offset-mode auto, default 30)')
-    p.add_argument('--cam-fov', type=float, default=78.0,
-                   help='FOV камеры в градусах (для --offset-mode auto, '
-                        'default 78.0 — из apf_with_lanes_drones.py)')
-    p.add_argument('--drone-overlap', type=float, default=0.2,
-                   help='OVERLAP из apf_with_lanes_drones.py (default 0.2)')
-    p.add_argument('--uav-offset', nargs='+', default=None,
-                   metavar='NAME:DX:DY',
-                   help='Ручные смещения для --offset-mode manual. '
-                        'Формат: uav0:0:3.4 uav1:0:10.1 uav2:0:16.4 '
-                        '(часть имени файла CSV : смещение по X : смещение по Y)')
+    p = argparse.ArgumentParser()
+    p.add_argument('--photos', nargs='+', default=None)
+    p.add_argument('--imgdir', default='.')
+    p.add_argument('--out', default='mosaic.jpg')
+    p.add_argument('--obstacles', default=None)
+    p.add_argument('--resolution', type=float, default=CANVAS_RES_M_PX)
+    p.add_argument('--yaw', action='store_true')
+    p.add_argument('--grid', action='store_true')
+    p.add_argument('--overlap', type=float, default=0.75)
+    p.add_argument('--force-agl', type=float, default=None, metavar='METERS')
+    p.add_argument('--offset-mode', choices=['none', 'auto', 'manual'], default='none')
+    p.add_argument('--field-wid', type=float, default=30.0)
+    p.add_argument('--cam-fov', type=float, default=78.0)
+    p.add_argument('--drone-overlap', type=float, default=0.2)
+    p.add_argument('--uav-offset', nargs='+', default=None, metavar='NAME:DX:DY')
     args = p.parse_args()
 
-    if args.demo:
-        photos_csv, imgdir = generate_demo(overlap=args.overlap)
-        photos = load_photos(photos_csv)
-        obstacles = []
-    else:
-        if not args.photos:
-            print('[err] Укажите --photos или используйте --demo')
-            sys.exit(1)
-        photos = load_photos(args.photos)
-        imgdir = args.imgdir
-        obstacles = load_obstacles(args.obstacles)
-        if len(photos) == 0:
-            print('[err] Нет снимков с ok=1.')
-            sys.exit(1)
 
-    # --force-agl: заменяем высоту во всех снимках одним значением.
-    # Это меняет размер footprint каждого патча → управляем перекрытием.
-    # Если флаг не задан, используем DEFAULT_FORCE_AGL_M из шапки файла.
+    if not args.photos:
+        print('[err] Укажите --photos или используйте --demo')
+        sys.exit(1)
+    photos = load_photos(args.photos)
+    imgdir = args.imgdir
+    obstacles = load_obstacles(args.obstacles)
+    if len(photos) == 0:
+        print('[err] Нет снимков с ok=1.')
+        sys.exit(1)
+
     effective_force_agl = args.force_agl
     if effective_force_agl is None and DEFAULT_FORCE_AGL_M is not None:
         effective_force_agl = DEFAULT_FORCE_AGL_M
@@ -700,10 +485,7 @@ def main():
         photos = photos.copy()
         photos['agl_m'] = effective_force_agl
 
-    # ── Коррекция смещений дронов ─────────────────────────────────────────────
     if args.offset_mode == 'none':
-        # Авто-применение захардкоженных смещений из UAV_LANE_Y.
-        # Если не хочешь — закомментируй строку или очисти словарь в шапке.
         if not args.demo and UAV_LANE_Y:
             photos = apply_hardcoded_lane_offsets(photos)
     else:
@@ -721,7 +503,7 @@ def main():
                 manual[parts[0]] = (float(parts[1]), float(parts[2]))
             photos = apply_lane_offsets(photos, mode='manual',
                                         manual_offsets=manual)
-        else:  # auto
+        else:
             photos = apply_lane_offsets(photos, mode='auto',
                                         field_wid=args.field_wid,
                                         cam_fov_deg=args.cam_fov,
@@ -737,7 +519,6 @@ def main():
     cv2.imwrite(args.out, mosaic)
     print(f'[done] {args.out}  ({mosaic.shape[1]}×{mosaic.shape[0]} пкс)')
 
-    # Миниатюра — удобно открывать быстро
     thumb_path = args.out.rsplit('.', 1)[0] + '_thumb.jpg'
     scale = min(1.0, 1200 / max(mosaic.shape[:2]))
     thumb = cv2.resize(mosaic,
