@@ -47,6 +47,8 @@ python3 orthophoto/build_map.py --photos photos_*_uav0_*.csv photos_*_uav1_*.csv
     --imgdir raw_images --out mosaic.jpg --grid
 ```
 
+Снимки и телеметрия этого прогона лежат в [релизе](../../releases/tag/orthophoto-sample). Полный набор данных серии лежит в релизе [ВКР](https://github.com/AlterPath/uav-swarm-formation-control/releases/tag/experiment-data).
+
 ## Стек
 
 Python, ROS (rospy), MAVROS, PX4 SITL, Gazebo, OpenCV, NumPy, pandas, graphviz.

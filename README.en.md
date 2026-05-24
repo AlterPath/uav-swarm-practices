@@ -47,6 +47,8 @@ python3 orthophoto/build_map.py --photos photos_*_uav0_*.csv photos_*_uav1_*.csv
     --imgdir raw_images --out mosaic.jpg --grid
 ```
 
+The photos and telemetry of this run are in the [release](../../releases/tag/orthophoto-sample). The full batch dataset is in the [thesis](https://github.com/AlterPath/uav-swarm-formation-control/releases/tag/experiment-data) release.
+
 Code comments and logs are in Russian.
 
 ## Tech stack
