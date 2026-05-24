@@ -486,7 +486,7 @@ def main():
         photos['agl_m'] = effective_force_agl
 
     if args.offset_mode == 'none':
-        if not args.demo and UAV_LANE_Y:
+        if UAV_LANE_Y:
             photos = apply_hardcoded_lane_offsets(photos)
     else:
         if args.offset_mode == 'manual':
