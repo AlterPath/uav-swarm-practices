@@ -56,3 +56,7 @@ Python, ROS (rospy), MAVROS, PX4 SITL, Gazebo, OpenCV, NumPy, pandas, graphviz.
 ## Лицензия
 
 [MIT](LICENSE)
+
+---
+
+<sub>Код написан с ноября 2025 по май 2026, на GitHub выложен в ноябре 2026. Даты коммитов взяты по датам исходных файлов, README и иллюстрации добавлены при выгрузке. Тогда же убрана оставшаяся проверка `args.demo` в `orthophoto/build_map.py`.</sub>
